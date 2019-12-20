@@ -230,7 +230,7 @@ class Agent():
         self.source_dist_optimizer.zero_grad()
         self.planning_dist_optimizer.zero_grad()
 
-        loss = -planning_log_prob - source_log_prob + self.prev_loss
+        loss = -planning_log_prob + source_log_prob
         self.prev_loss = loss
 
         c_loss = F.smooth_l1_loss(q_eval, q_target) + loss
@@ -249,6 +249,7 @@ class Agent():
 
         if self.training_step % 200 == 0:
             self.target_cnet.load_state_dict(self.eval_cnet.state_dict())
+            print("MUTUAL INFO: ", loss)
         if self.training_step % 201 == 0:
             self.target_anet.load_state_dict(self.eval_anet.state_dict())
 
@@ -300,6 +301,7 @@ for i_ep in range(1000):
         score += reward
         memory.update(Transition(state, action, (reward + 8) / 8, state_))
         state = state_
+        env.render()
         if memory.isfull:
             transitions = memory.sample(16)
             q = agent.update(transitions)
@@ -310,7 +312,7 @@ for i_ep in range(1000):
     if i_ep % LOG_INTERVAL == 0:
         print('Step {}\tAverage score: {:.2f}\tAverage Q: {:.2f}'.format(
                 i_ep, running_reward, running_q))
-        env.render()
+
     if running_reward > -200:
         print("Solved! Running reward is now {}!".format(running_reward))
         env.close()
@@ -328,3 +330,4 @@ plt.xlabel('Episode')
 plt.ylabel('Moving averaged episode reward')
 plt.savefig("ddpg.png")
 plt.show()
+
