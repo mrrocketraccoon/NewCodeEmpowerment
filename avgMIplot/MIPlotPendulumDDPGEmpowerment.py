@@ -307,7 +307,7 @@ for i_ep in range(500):
         print('Step {}\tAverage score: {:.2f}\tAverage Q: {:.2f}\tMI: {:.2f}'.format(
                 i_ep, running_reward, running_q, MI))
 
-    if running_reward > -1000:
+    if running_reward > -200:
         print("Solved! Running reward is now {}!".format(running_reward))
         env.close()
         torch.save(agent.eval_anet.state_dict(), 'ddpg_anet_params.pkl')
