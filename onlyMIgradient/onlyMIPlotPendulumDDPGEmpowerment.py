@@ -197,7 +197,7 @@ class Agent():
         self.optimizer_a = optim.Adam(self.eval_anet.parameters(), lr=3e-4)
         self.source_dist_optimizer = optim.Adam(self.source_distribution.parameters(), lr=1e-3)
         self.planning_dist_optimizer = optim.Adam(self.source_distribution.parameters(), lr=1e-3)
-
+        self.avg_MI = 0
     def select_action(self, state):
         state = torch.from_numpy(state).float().unsqueeze(0)
         mu = self.eval_anet(state)
@@ -230,7 +230,7 @@ class Agent():
 
         extra_loss = -planning_log_prob + source_log_prob
         c_loss = F.smooth_l1_loss(q_eval, q_target)
-        a_loss = -self.eval_cnet(s, self.eval_anet(s)).mean() + extra_loss
+        a_loss = extra_loss
         c_loss.backward(retain_graph=True)
         nn.utils.clip_grad_norm_(self.eval_cnet.parameters(), self.max_grad_norm)
         self.optimizer_c.step()
@@ -242,6 +242,7 @@ class Agent():
         nn.utils.clip_grad_norm_(self.planning_distribution.parameters(), 0.5)
         self.planning_dist_optimizer.step()
 
+
         if self.training_step % 200 == 0:
             self.target_cnet.load_state_dict(self.eval_cnet.state_dict())
         if self.training_step % 201 == 0:
@@ -250,7 +251,33 @@ class Agent():
 
         return q_eval.mean().item(), -extra_loss.item()
 
+from PIL import Image
+import torchvision.transforms as T
+resize = T.Compose([T.ToPILImage(),
+                    T.Resize(40, interpolation=Image.CUBIC),
+                    T.ToTensor()])
+
+def get_screen():
+    screen = env.render(mode='rgb_array').transpose((2, 0, 1))
+    # Cart is in the lower half, so strip off the top and bottom of the screen
+    _, screen_height, screen_width = screen.shape
+    screen = np.ascontiguousarray(screen, dtype=np.float32) / 255
+    screen = torch.from_numpy(screen)
+    # Resize, and add a batch dimension (BCHW)
+    return resize(screen).unsqueeze(0).to(device)
+
 agent = Agent(n_actions=1, n_states=3)
+
+state = env.reset()
+action = agent.select_action(state)
+state, reward, done, _ = env.step(action)
+
+plt.figure()
+plt.imshow(get_screen().cpu().squeeze(0).permute(1, 2, 0).numpy(),
+           interpolation='none')
+env.close()
+plt.title('Example extracted screen, state = x: {:.3f} y: {:.3f} angle vel: {:.3f}, action: {:.3f}'.format(state[0], state[1], state[2], action[0]))
+plt.show()
 
 
 training_records = []

@@ -1,14 +1,12 @@
 import pickle
 from collections import namedtuple
-
 import gym
-from gym import spaces
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Normal
-
+from torch.autograd import Variable
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -52,48 +50,75 @@ BETA = 5
 PATH = "saved_weights_{}"
 
 class Source(nn.Module):
-    def __init__(self, n_actions, n_states):
+    def __init__(self):
         super(Source, self).__init__()
-        self.fc = nn.Linear(n_states, 100)
-        self.mu_head = nn.Linear(100, 1)
-        self.var = nn.Linear(100, 1)
-    def forward(self, s):
-        s = torch.from_numpy(s).float().unsqueeze(0)
-        x = F.relu(self.fc(s))
-        mu = 2.0 * torch.tanh(self.mu_head(x))
-        sig = F.elu(self.var(x))+1
-        return mu, sig
-    def select_action(self, state):
-        mean, var = self.forward(state)
-        dist = Normal(mean, var)
-        action = dist.sample()
-        action.clamp(-2.0, 2.0)
-        return action, dist.log_prob(action)
+
+        self.fc1 = nn.Linear(3, 2)
+        self.fc21 = nn.Linear(2, 1)
+        self.fc22 = nn.Linear(2, 1)
+        self.fc3 = nn.Linear(1, 2)
+        self.fc4 = nn.Linear(2, 3)
+
+    def encode(self, x):
+        h1 = F.relu(self.fc1(x))
+        return self.fc21(h1), self.fc22(h1)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps*std
+
+    def decode(self, z):
+        h3 = F.relu(self.fc3(z))
+        return torch.sigmoid(self.fc4(h3))
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
 
 class Planning(nn.Module):
-    def __init__(self, n_actions, n_states):
+    def __init__(self):
         super(Planning, self).__init__()
-        self.fc1 = nn.Linear(n_states, 100)
-        self.fc2 = nn.Linear(n_states, 100)
-        self.fc = nn.Linear(200, 100)
-        self.mu_head = nn.Linear(100, 1)
-        self.var = nn.Linear(100, 1)
-    def forward(self, s, s_next):
-        s = torch.from_numpy(s).float().unsqueeze(0)
-        s = F.relu(self.fc1(s))
-        s_next = F.relu(self.fc2(s_next))
-        s_cat = torch.cat([s, s_next], dim=-1)
-        x = F.relu(self.fc(s_cat))
-        mu = 2.0 * torch.tanh(self.mu_head(x))
-        sig = F.elu(self.var(x)) + 1
-        return mu, sig
-    def select_action(self, state, state_next):
-        state_next = torch.from_numpy(state_next).float().unsqueeze(0)
-        mean, variance = self.forward(state, state_next)
-        dist = Normal(mean, variance)
-        action = dist.sample()
-        action.clamp(-2.0, 2.0)
-        return action, dist.log_prob(action)
+
+        self.fc1 = nn.Linear(6, 2)
+        self.fc21 = nn.Linear(2, 1)
+        self.fc22 = nn.Linear(2, 1)
+        self.fc3 = nn.Linear(1, 2)
+        self.fc4 = nn.Linear(2, 6)
+
+    def encode(self, x, x_):
+        h1 = F.relu(self.fc1(torch.cat([x, x_], dim=-1)))
+        return self.fc21(h1), self.fc22(h1)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps*std
+
+    def decode(self, z):
+        h3 = F.relu(self.fc3(z))
+        return torch.sigmoid(self.fc4(h3))
+
+    def forward(self, x, x_):
+        mu, logvar = self.encode(x, x_)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+
+# Reconstruction + KL divergence losses summed over all elements and batch
+def loss_function(recon_x, x, mu, logvar):
+    BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
+
+    # see Appendix B from VAE paper:
+    # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
+    # https://arxiv.org/abs/1312.6114
+    # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+    return BCE + KLD
+
 
 class ActorNet(nn.Module):
     def __init__(self, n_actions, n_states):
@@ -168,12 +193,11 @@ class Agent():
 training_records = []
 running_reward, running_q = -1000, 0        
 memory = Memory(2000)
-
 agent = Agent(n_actions=1, n_states=3)
-source_distribution = Source(n_actions=1, n_states=3)
-planning_distribution = Planning(n_actions=1, n_states=3)
-source_dist_optimizer = torch.optim.SGD(source_distribution.parameters(), lr=1e-3)
-planning_dist_optimizer = optim.SGD(planning_distribution.parameters(), lr=1e-3)
+source_network = Source().double()
+planning_network = Planning().double()
+source_optimizer = optim.Adam(source_network.parameters(), lr=1e-3)
+planning_optimizer = optim.Adam(planning_network.parameters(), lr=1e-3)
 epoch = 0
 
 while epoch <= 50:
@@ -185,27 +209,48 @@ while epoch <= 50:
             action, policy_dist = agent.select_action(state)
             state_, reward, done, _ = env.step(action)
             #print(forward_dynamics.step(torch.tensor(np.asarray(action)).unsqueeze(0),state), state_)
+            state = Variable(torch.from_numpy(state).double())
+            state_ = Variable(torch.from_numpy(state_).double())
             score += reward
             memory.update(Transition(state, action, (reward + 8) / 8, state_))
-            source_sample, source_log_prob = source_distribution.select_action(state)
-            planning_sample, planning_log_prob = planning_distribution.select_action(state, state_)
+            source_lat, source_mu, source_logvar = source_network(state)
+            source_dist = Normal(source_mu, source_logvar)
+            source_action = source_dist.sample()
+            source_action.clamp(-2.0, 2.0)
+            source_log_prob = source_dist.log_prob(source_action)
+
+            planning_lat, planning_mu, planning_logvar = planning_network(state, state_)
+            planning_dist = Normal(planning_mu, planning_logvar)
+            planning_action = planning_dist.sample()
+            planning_action.clamp(-2.0, 2.0)
+            planning_log_prob = planning_dist.log_prob(planning_action)
+
             MI = planning_log_prob - source_log_prob
-            empowerment += -MI - torch.distributions.kl.kl_divergence(policy_dist, Normal(torch.tensor([[0.0]]),torch.tensor([[1.0]]))).mean()
+            empowerment += -MI - torch.distributions.kl.kl_divergence(policy_dist, Normal(torch.tensor([[0.0]]),torch.tensor([[1.0]])))
             state = state_
             env.render()
         print("trajectory: ", m)
+
     if memory.isfull:
         transitions = memory.sample(16)
         q = agent.update(transitions)
         running_q = 0.99 * running_q + 0.01 * q
         empowerment.backward()
-        source_dist_optimizer.zero_grad()
-        planning_dist_optimizer.zero_grad()
-        nn.utils.clip_grad_norm_(source_distribution.parameters(), 0.5)
-        source_dist_optimizer.step()
-        nn.utils.clip_grad_norm_(planning_distribution.parameters(), 0.5)
-        planning_dist_optimizer.step()
-
+        source_optimizer.zero_grad()
+        planning_optimizer.zero_grad()
+        nn.utils.clip_grad_norm_(source_network.parameters(), 0.5)
+        source_optimizer.step()
+        nn.utils.clip_grad_norm_(planning_network.parameters(), 0.5)
+        planning_optimizer.step()
+    '''model.train()
+    train_loss = 0
+    data = data
+    optimizer.zero_grad()
+    recon_batch, mu, logvar = model(data)
+    loss = loss_function(recon_batch, data, mu, logvar)
+    loss.backward()
+    train_loss += loss.item()
+    optimizer.step()'''
     running_reward = running_reward * 0.9 + score * 0.1
     training_records.append(TrainingRecord(m, running_reward, empowerment.item()))
     print('Epoch {}\tAverage score: {:.2f}\tAverage Q: {:.2f}\tEmpowerment: {:.2f}'.format(
